@@ -206,7 +206,7 @@ static HorovodGlobalState horovod_global;
 #define TAG_NOTIFY 1
 
 // Stall-check warning time
-#define STALL_WARNING_TIME std::chrono::seconds(60)
+#define STALL_WARNING_TIME std::chrono::seconds(3600)
 
 static const Status NOT_INITIALIZED_ERROR = Status::PreconditionError(
     "Horovod has not been initialized; use hvd.init().");

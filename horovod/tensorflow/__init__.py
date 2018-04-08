@@ -165,7 +165,7 @@ class DistributedOptimizer(tf.train.Optimizer):
         super(DistributedOptimizer, self).__init__(
             name=name, use_locking=use_locking)
 
-    def compute_gradients(self, *args, **kwargs):
+    def compute_gradients(self, loss, *args, **kwargs):
         """Compute gradients of all trainable variables.
 
         See Optimizer.compute_gradients() for more info.
@@ -174,14 +174,25 @@ class DistributedOptimizer(tf.train.Optimizer):
         allreduce the gradients before returning them.
         """
         gradients = (super(DistributedOptimizer, self)
-                     .compute_gradients(*args, **kwargs))
+                     .compute_gradients(loss, *args, **kwargs))
         if size() > 1:
             averaged_gradients = []
             with tf.name_scope(self._name + "_Allreduce"):
                 for grad, var in gradients:
                     if grad is not None:
-                        avg_grad = allreduce(grad, device_dense=self._device_dense,
-                                             device_sparse=self._device_sparse)
+                        grad_r = tf.get_variable(''.join(grad.name.split(':')[:-1])+'_r', grad.get_shape(), dtype=grad.dtype,
+                                                 initializer=tf.constant_initializer(0), trainable=False)
+                        grad_c = tf.get_variable(''.join(grad.name.split(':')[:-1])+'_c', grad.get_shape(), dtype=grad.dtype,
+                                                 initializer=tf.constant_initializer(0), trainable=False)
+
+                        reduce_grad = allreduce(grad_r, device_dense=self._device_dense,
+                                                device_sparse=self._device_sparse)
+                        with tf.control_dependencies([loss]):
+                            avg_grad = tf.identity(reduce_grad)
+
+                        tf.add_to_collection(tf.GraphKeys.UPDATE_OPS, grad_c.assign(grad))
+                        tf.add_to_collection('horovod_grad_flip', grad_r.assign(grad_c))
+
                         averaged_gradients.append((avg_grad, var))
                     else:
                         averaged_gradients.append((None, var))

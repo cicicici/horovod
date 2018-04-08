@@ -43,6 +43,10 @@ from horovod.tensorflow.mpi_ops import broadcast
 from horovod.tensorflow.mpi_ops import _allreduce
 
 
+class GraphKeys(object):
+    GRAD_FLIP_OPS = "horovod_grad_flip_ops"
+
+
 def allreduce(tensor, average=True, device_dense='', device_sparse=''):
     """Perform an allreduce on a tf.Tensor or tf.IndexedSlices.
 
@@ -128,12 +132,35 @@ class BroadcastGlobalVariablesHook(tf.train.SessionRunHook):
         session.run(self.bcast_op)
 
 
+class PostStepHook(tf.train.SessionRunHook):
+    """
+    SessionRunHook that will do post ops after each step.
+
+    This is necessary for deferred allreduce, will flip cached grad to
+    the buffer for allreduce.
+    """
+
+    def __init__(self):
+        """Construct a new PostStepHook
+
+        Args:
+        """
+        super(PostStepHook, self).__init__()
+
+        self.grad_flip_ops = [t for t in tf.get_collection(GraphKeys.GRAD_FLIP_OPS)]
+        self.grad_flip_ops_group = tf.group(*(self.grad_flip_ops))
+
+    def after_run(self, run_context, run_values):
+        if len(self.grad_flip_ops) > 0:
+            run_context.session.run(self.grad_flip_ops_group)
+
+
 class DistributedOptimizer(tf.train.Optimizer):
     """An optimizer that wraps another tf.Optimizer, using an allreduce to
     average gradient values before applying gradients to model weights."""
 
     def __init__(self, optimizer, name=None, use_locking=False, device_dense='',
-                 device_sparse=''):
+                 device_sparse='', deferred=False):
         """Construct a new DistributedOptimizer, which uses another optimizer
         under the hood for computing single-process gradient values and
         applying gradient updates after the gradient values have been averaged
@@ -162,10 +189,11 @@ class DistributedOptimizer(tf.train.Optimizer):
         self._optimizer = optimizer
         self._device_dense = device_dense
         self._device_sparse = device_sparse
+        self._deferred = deferred
         super(DistributedOptimizer, self).__init__(
             name=name, use_locking=use_locking)
 
-    def compute_gradients(self, *args, **kwargs):
+    def compute_gradients(self, loss, *args, **kwargs):
         """Compute gradients of all trainable variables.
 
         See Optimizer.compute_gradients() for more info.
@@ -174,14 +202,29 @@ class DistributedOptimizer(tf.train.Optimizer):
         allreduce the gradients before returning them.
         """
         gradients = (super(DistributedOptimizer, self)
-                     .compute_gradients(*args, **kwargs))
+                     .compute_gradients(loss, *args, **kwargs))
         if size() > 1:
             averaged_gradients = []
             with tf.name_scope(self._name + "_Allreduce"):
                 for grad, var in gradients:
                     if grad is not None:
-                        avg_grad = allreduce(grad, device_dense=self._device_dense,
-                                             device_sparse=self._device_sparse)
+                        if self._deferred:
+                            grad_r = tf.get_variable(''.join(grad.name.split(':')[:-1])+'_r', grad.get_shape(), dtype=grad.dtype,
+                                                     initializer=tf.constant_initializer(0), trainable=False)
+                            grad_c = tf.get_variable(''.join(grad.name.split(':')[:-1])+'_c', grad.get_shape(), dtype=grad.dtype,
+                                                     initializer=tf.constant_initializer(0), trainable=False)
+
+                            reduce_grad = allreduce(grad_r, device_dense=self._device_dense,
+                                                    device_sparse=self._device_sparse)
+                            with tf.control_dependencies([loss]):
+                                avg_grad = tf.identity(reduce_grad)
+
+                            tf.add_to_collection(tf.GraphKeys.UPDATE_OPS, grad_c.assign(grad))
+                            tf.add_to_collection(GraphKeys.GRAD_FLIP_OPS, grad_r.assign(grad_c))
+                        else:
+                            avg_grad = allreduce(grad, device_dense=self._device_dense,
+                                                 device_sparse=self._device_sparse)
+
                         averaged_gradients.append((avg_grad, var))
                     else:
                         averaged_gradients.append((None, var))
